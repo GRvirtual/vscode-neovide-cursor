@@ -13,6 +13,14 @@ const ANIMATION_SETTINGS = {
 
 // -----------------------
 
+const globalCursorState = {
+  lastX: null,
+  lastY: null,
+  lastWidth: null,
+  lastHeight: null,
+  lastUpdated: 0,
+};
+
 const STANDARD_CORNERS = [
   { x: -0.5, y: -0.5 }, { x: 0.5, y: -0.5 },
   { x: 0.5, y: 0.5 }, { x: -0.5, y: 0.5 }
@@ -236,22 +244,50 @@ function createNeovideCursor(options) {
     if (height) cursorDimensions.height = height;
   }
 
-  function move(x, y) {
+  function move(x, y, fromSource = null) {
+    if ((x <= 0 && y <= 0) || Number.isNaN(x) || Number.isNaN(y)) return;
+
     destination = { x, y };
     centerDestination = {
       x: destination.x + cursorDimensions.width / 2,
       y: destination.y + cursorDimensions.height / 2
     };
-    jumped = true;
 
-    if (!initialized) {
-      corners.forEach(corner => {
-        const cornerDest = corner.getDestination(centerDestination, cursorDimensions);
-        corner.currentPosition = { ...cornerDest };
-        corner.previousDestination = { ...cornerDest };
-      });
+    if (!initialized || fromSource) {
+      const src = fromSource ||
+        (globalCursorState.lastX
+          ? {
+            x: globalCursorState.lastX,
+            y: globalCursorState.lastY,
+          }
+          : null);
+
+      if (src) {
+        const oldDim = {
+          width: globalCursorState.lastWidth || cursorDimensions.width,
+          height: globalCursorState.lastHeight || cursorDimensions.height,
+        };
+        corners.forEach((corner) => {
+          corner.previousDestination = corner.getDestination(src, oldDim);
+          corner.currentPosition = { ...corner.previousDestination };
+        });
+      } else {
+        corners.forEach((corner) => {
+          const cornerDest = corner.getDestination(centerDestination, cursorDimensions);
+          corner.currentPosition = { ...cornerDest };
+          corner.previousDestination = { ...cornerDest };
+        });
+      }
       initialized = true;
     }
+
+    jumped = true;
+
+    globalCursorState.lastX = centerDestination.x;
+    globalCursorState.lastY = centerDestination.y;
+    globalCursorState.lastWidth = cursorDimensions.width;
+    globalCursorState.lastHeight = cursorDimensions.height;
+    globalCursorState.lastUpdated = Date.now();
   }
 
   function drawCursorShape() {
@@ -341,10 +377,10 @@ class GlobalCursorManager {
     this.canvas.style.height = "100vh";
     document.body.appendChild(this.canvas);
 
-    window.addEventListener("resize", () => this.updateCanvasSize());
     this.updateCanvasSize();
+    window.addEventListener("resize", () => this.updateCanvasSize());
 
-    document.addEventListener('scroll', () => {
+    document.addEventListener("scroll", () => {
       this.isScrolling = true;
       clearTimeout(this.scrollTimeout);
       this.scrollTimeout = setTimeout(() => {
@@ -352,8 +388,8 @@ class GlobalCursorManager {
       }, 100);
     }, { capture: true, passive: true });
 
+    this.scanCursors();
     this.loop();
-
     setInterval(() => this.scanCursors(), cursorUpdatePollingRate);
   }
 
@@ -367,10 +403,10 @@ class GlobalCursorManager {
     const cursorElements = document.querySelectorAll(".monaco-editor .cursor");
 
     cursorElements.forEach((target) => {
-      let cursorId = target.getAttribute("custom-cursor-id");
+      let cursorId = target.dataset.cursorId;
       if (!cursorId) {
-        cursorId = Math.random().toString(36).substring(7);
-        target.setAttribute("custom-cursor-id", cursorId);
+        cursorId = `cursor-${Math.random().toString(36).slice(2, 10)}`;
+        target.dataset.cursorId = cursorId;
       }
       nowIds.add(cursorId);
 
@@ -378,19 +414,35 @@ class GlobalCursorManager {
         const instance = createNeovideCursor({ canvas: this.canvas });
         const rect = target.getBoundingClientRect();
         instance.updateCursorSize(rect.width, rect.height);
-        instance.setPosition(rect.left, rect.top);
+
+        // fix: instance position and cached position are not same
+        instance.setPosition(
+          rect.left,
+          rect.top,
+        );
+        instance.move(
+          rect.left,
+          rect.top,
+        );
 
         this.cursors.set(cursorId, {
           instance,
-          target: target,
+          target,
           lastX: rect.left,
-          lastY: rect.top
+          lastY: rect.top,
+          lastW: rect.width,
+          lastH: rect.height,
+          isActive: false,
+          isJumping: true,
+          jumpSource: globalCursorState.lastX
+            ? { x: globalCursorState.lastX, y: globalCursorState.lastY }
+            : null,
         });
       }
     });
 
-    for (const [id, _] of this.cursors) {
-      if (!nowIds.has(id)) {
+    for (const [id, data] of this.cursors) {
+      if (!nowIds.has(id) || !data.target?.isConnected) {
         this.cursors.delete(id);
       }
     }
@@ -410,24 +462,51 @@ class GlobalCursorManager {
     const { instance, target } = data;
 
     const computed = getComputedStyle(target);
-    if (computed.visibility === "hidden" || computed.display === "none" || computed.opacity === "0") {
-      return;
-    }
+    if (!target || !target.isConnected) return;
+
+    const isNowActive =
+      computed.visibility !== "hidden" &&
+      computed.display !== "none" &&
+      computed.opacity !== "0" &&
+      !computed.transform.includes("-10000px");
 
     const rect = target.getBoundingClientRect();
+    const hasMoved = rect.left !== data.lastX || rect.top !== data.lastY;
+    const hasResized = rect.width !== data.lastW || rect.height !== data.lastH;
     const isOffScreen = rect.right < 0 || rect.bottom < 0 ||
       rect.left > window.innerWidth || rect.top > window.innerHeight;
 
-    if (rect.left !== data.lastX || rect.top !== data.lastY) {
-      instance.move(rect.left, rect.top);
-      instance.updateCursorSize(rect.width, rect.height);
-      data.lastX = rect.left;
-      data.lastY = rect.top;
+    if (isNowActive && !data.isActive) {
+      data.isJumping = true;
+      data.jumpSource = globalCursorState.lastX
+        ? { x: globalCursorState.lastX, y: globalCursorState.lastY }
+        : null;
     }
 
-    instance.updateLoopLogic(this.isScrolling, !isOffScreen);
+    if (data.isJumping && (hasMoved || hasResized)) {
+      instance.updateCursorSize(rect.width, rect.height);
+      instance.move(rect.left, rect.top, data.jumpSource);
+      data.isJumping = false;
+      data.lastX = rect.left;
+      data.lastY = rect.top;
+      data.lastW = rect.width;
+      data.lastH = rect.height;
+    } else if (isNowActive && (hasMoved || hasResized)) {
+      instance.updateCursorSize(rect.width, rect.height);
+      instance.move(rect.left, rect.top);
+      data.lastX = rect.left;
+      data.lastY = rect.top;
+      data.lastW = rect.width;
+      data.lastH = rect.height;
+    }
+
+    data.isActive = isNowActive;
+    if (isNowActive) {
+      instance.updateLoopLogic(this.isScrolling, !isOffScreen);
+    }
   }
 }
+
 
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", () => new GlobalCursorManager());
