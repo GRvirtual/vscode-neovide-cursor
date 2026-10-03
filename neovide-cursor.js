@@ -508,8 +508,11 @@ class GlobalCursorManager {
 }
 
 
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", () => new GlobalCursorManager());
-} else {
-  new GlobalCursorManager();
-}
+const startNeovideCursor = () => {
+	if (document.body) {
+		new GlobalCursorManager();
+	} else {
+		window.addEventListener("DOMContentLoaded", () => new GlobalCursorManager());
+	}
+};
+startNeovideCursor();
